@@ -22,7 +22,9 @@ use std::time::SystemTime;
 
 use lithos_llm::Client;
 use lithos_llm::types::{Error as LlmError, ErrorKind as LlmErrorKind, ReasoningEffort, Speed};
-use pebble_agent::{Agent, AgentControlHandle, ToolMiddleware, UserMessage};
+use pebble_agent::{Agent, AgentControlHandle, ToolMiddleware};
+#[cfg(test)]
+use pebble_agent::UserMessage;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -62,9 +64,10 @@ use crate::tools::skill::make_use_skill_tool_for_vocabulary;
 use crate::types::PermissionLevel;
 use crate::types::{
     AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, ContextWindowSnapshot,
-    InputContent, InputSource, MemoryFileSummary, Message, SkillSummary, ToolSummary, Usage,
-    is_prompt_source, rfc3339_millis,
+    MemoryFileSummary, Message, SkillSummary, ToolSummary, Usage, is_prompt_source, rfc3339_millis,
 };
+#[cfg(test)]
+use crate::types::{InputContent, InputSource};
 use crate::{SessionId, SessionScope, discovery};
 
 /// How long a probe run inside the environment may take.
