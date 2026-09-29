@@ -814,7 +814,17 @@ impl agent::AgentLifecycle for CodingAgentBridge {
         let attribution = message.attribution().cloned();
         let content = InputContent::from(message.content());
         let text = content.text_content();
-        let expanded = if self.resources.skills.is_empty() {
+        // A queued turn a person typed carries the Prompt or FollowUp source
+        // and its `/name` reference expands. Every synthesized turn — a
+        // subagent's result envelope, a continuation, an integration's
+        // assembled text — passes through unchanged, as `SkillExpansion`'s
+        // contract says: expanding it would fail on an unknown skill or
+        // splice a template over it.
+        let typed = matches!(
+            input_source_from_attribution(attribution.as_ref()),
+            Some(InputSource::Prompt | InputSource::FollowUp)
+        );
+        let expanded = if self.resources.skills.is_empty() || !typed {
             ExpandedInput {
                 text:       text.to_owned(),
                 skill_name: None,

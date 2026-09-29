@@ -22,7 +22,7 @@ use std::time::SystemTime;
 
 use lithos_llm::Client;
 use lithos_llm::types::{Error as LlmError, ErrorKind as LlmErrorKind, ReasoningEffort, Speed};
-use pebble_agent::{Agent, AgentControlHandle, ToolMiddleware};
+use pebble_agent::{Agent, AgentControlHandle, ToolMiddleware, UserMessage};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -62,7 +62,8 @@ use crate::tools::skill::make_use_skill_tool_for_vocabulary;
 use crate::types::PermissionLevel;
 use crate::types::{
     AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, ContextWindowSnapshot,
-    MemoryFileSummary, Message, SkillSummary, ToolSummary, Usage, rfc3339_millis,
+    InputContent, InputSource, MemoryFileSummary, Message, SkillSummary, ToolSummary, Usage,
+    is_prompt_source, rfc3339_millis,
 };
 use crate::{SessionId, SessionScope, discovery};
 
@@ -907,10 +908,23 @@ impl CodingRuntime {
         let _ = self.agent_control.enqueue_steering(text.into());
     }
 
-    /// Queues more input to process once the current input is finished.
+    /// Queues typed input to process once the current input is finished, as
+    /// the steering bus queues a person's follow-up: sourced `FollowUp`, so a
+    /// `/name` reference in it expands.
     #[cfg(test)]
     pub(crate) fn follow_up(&self, message: impl Into<String>) {
-        let _ = self.agent_control.follow_up(message.into());
+        let input = input_message(InputContent::text(message.into()), InputSource::FollowUp);
+        let _ = self.agent_control.follow_up(input);
+    }
+
+    /// Queues synthesized input carrying no source, as a subagent's result
+    /// envelope or a continuation arrives: nothing in it expands.
+    #[cfg(test)]
+    pub(crate) fn follow_up_unattributed(&self, message: impl Into<String>) {
+        let text: String = message.into();
+        let _ = self
+            .agent_control
+            .follow_up(UserMessage::new(InputContent::text(text).into_parts()));
     }
 
     /// Ends the prompt.
@@ -1157,8 +1171,18 @@ impl CodingRuntime {
         let timer = self.start_wall_clock_timer(&prompt_cancel);
         let result = match start {
             PromptStart::Input(input) => {
-                self.process_input(input, SkillExpansion::Apply, &prompt_cancel)
-                    .await
+                // The input's source decides: a `/name` reference a person
+                // typed expands, input the caller synthesized passes through
+                // unchanged, as `SkillExpansion`'s contract says. Synthesized
+                // input carries paths and result envelopes with slash-prefixed
+                // words of their own; expanding it would fail on an unknown
+                // skill or splice a template over it.
+                let expansion = if is_prompt_source(&input.source()) {
+                    SkillExpansion::Apply
+                } else {
+                    SkillExpansion::Skip
+                };
+                self.process_input(input, expansion, &prompt_cancel).await
             }
             PromptStart::Continue => self.continue_input(&prompt_cancel).await,
         };

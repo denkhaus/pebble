@@ -33,7 +33,7 @@ use crate::test_support::{
 use crate::tools::{
     WebFetchSummarizer, make_apply_patch_tool, make_shell_tool, make_web_fetch_tool,
 };
-use crate::types::{CommandTermination, ExecOutputTail, SkillActivationSource};
+use crate::types::{CommandTermination, ExecOutputTail, InputSource, SkillActivationSource};
 
 const SECRET: &str = "AKIAYRWQG5EJLPZLBYNP";
 
@@ -373,6 +373,62 @@ async fn an_unknown_slash_skill_in_a_follow_up_keeps_its_typed_error() {
 
     assert!(matches!(error, Error::SkillExpansion(_)), "{error:?}");
     assert_eq!(ErrorData::from(&error).kind, ErrorKind::InvalidInput);
+}
+
+#[tokio::test]
+async fn typed_input_with_two_slash_references_is_refused() {
+    let (mut session, provider) = session_with_a_skill(answers("unused"));
+    session.initialize().await.expect("initialization succeeds");
+
+    let error = session
+        .prompt("cd /workspace using /tmp storage")
+        .await
+        .expect_err("two references are ambiguous typed input");
+
+    assert!(matches!(error, Error::SkillExpansion(_)), "{error:?}");
+    assert_eq!(
+        ErrorData::from(&error).message,
+        "expanding a skill reference: Only one skill reference per input is allowed"
+    );
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "invalid input makes no model call"
+    );
+}
+
+#[tokio::test]
+async fn synthesized_input_passes_slash_tokens_through_unchanged() {
+    let (mut session, provider) = session_with_a_skill(answers("done"));
+    session.initialize().await.expect("initialization succeeds");
+
+    let output = session
+        .prompt(
+            CodingInput::text("cd /workspace using /tmp storage").with_source(InputSource::Agent),
+        )
+        .await
+        .expect("synthesized input is not skill-expanded");
+
+    assert_eq!(output.as_deref(), Some("done"));
+    assert_eq!(provider.call_count(), 1, "the turn ran one model call");
+}
+
+#[tokio::test]
+async fn a_synthesized_queued_turn_passes_slash_tokens_through() {
+    let (mut session, _provider) = session_with_a_skill(answers("first"));
+    session.initialize().await.expect("initialization succeeds");
+    session.follow_up_unattributed("cd /workspace using /tmp storage");
+
+    let output = session
+        .prompt("start")
+        .await
+        .expect("a queued synthesized turn is not skill-expanded");
+
+    assert_eq!(
+        output.as_deref(),
+        Some("first"),
+        "the scripted provider answers forever, so the turn completed"
+    );
 }
 
 #[tokio::test]
