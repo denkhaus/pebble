@@ -268,7 +268,9 @@ impl ProjectMemory {
 
 /// Reads one memory file, answering `None` for anything the loader skips.
 ///
-/// The cancellation token is checked on both sides of the read, so a cancel
+/// An absent candidate is probed, not read: the miss stays a DEBUG line
+/// instead of a failed read the environment reports as an error. The
+/// cancellation token is checked on both sides of the read, so a cancel
 /// that arrives while a slow environment is reading is noticed before the next
 /// file is opened.
 async fn read_memory_file(
@@ -278,6 +280,19 @@ async fn read_memory_file(
 ) -> Result<Option<String>> {
     if cancel.is_cancelled() {
         return Err(Error::Interrupted(InterruptReason::Cancelled));
+    }
+
+    // Memory candidates are OPTIONAL files: a convention path such as
+    // `.codex/instructions.md` is usually absent, and a blind read makes
+    // the sandbox driver surface the miss as a failed operation
+    // (`read{...} fs: error=File ... was not found`), burying real
+    // failures in the run view. Probing existence first keeps the
+    // expected miss at DEBUG and never issues the failing read; a probe
+    // that itself errors falls through to the read, preserving the old
+    // behavior where the read can still succeed.
+    if matches!(env.file_exists(path).await, Ok(false)) {
+        debug!(path, "Memory file absent, skipping");
+        return Ok(None);
     }
 
     let read = env.read_file_text(path).await;

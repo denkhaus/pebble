@@ -58,6 +58,9 @@ pub struct MockEnvironment {
     pub exec_error:            Option<String>,
     /// The `(path, content)` pair of every write.
     pub written_files:         Mutex<Vec<(String, String)>>,
+    /// Every path [`read_file_bytes`](Environment::read_file_bytes) was
+    /// called with, in call order — pins which reads a code path issues.
+    pub read_attempts:         Mutex<Vec<String>>,
     /// How many times [`write_existing_file`](Environment::write_existing_file)
     /// was called.
     pub existing_file_writes:  AtomicUsize,
@@ -118,6 +121,7 @@ impl Default for MockEnvironment {
             streams_separated:     true,
             exec_error:            None,
             written_files:         Mutex::new(Vec::new()),
+            read_attempts:         Mutex::new(Vec::new()),
             existing_file_writes:  AtomicUsize::new(0),
             captured_timeout:      Mutex::new(None),
             captured_command:      Mutex::new(None),
@@ -145,6 +149,10 @@ impl Environment for MockEnvironment {
     }
 
     async fn read_file_bytes(&self, path: &str) -> EnvResult<Vec<u8>> {
+        self.read_attempts
+            .lock()
+            .expect("read attempts lock")
+            .push(path.to_owned());
         self.files
             .get(path)
             .map(|content| content.as_bytes().to_vec())

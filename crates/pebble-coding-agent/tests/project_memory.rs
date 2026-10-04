@@ -185,3 +185,34 @@ async fn nothing_to_load_gives_the_agent_and_the_loader_nothing() {
         .await
         .expect("the agent shuts down");
 }
+
+#[tokio::test]
+async fn an_absent_candidate_probes_existence_instead_of_failing_the_read() {
+    let (env, paths) = fixture();
+    let env = Arc::new(env);
+
+    let memory = ProjectMemory::load(env.as_ref(), &paths, &CancellationToken::new())
+        .await
+        .expect("the load succeeds");
+    assert!(
+        memory
+            .documents()
+            .iter()
+            .all(|document| document.path() != "/home/test/MISSING.md"),
+        "the absent file never becomes a document"
+    );
+
+    // The regression this pins (fabro-5c45): a blind read of the absent
+    // candidate makes the sandbox driver surface the miss as a failed
+    // operation. The loader must probe existence instead, so no read is
+    // issued for the missing path at all.
+    let attempts = env.read_attempts.lock().expect("read attempts lock");
+    assert!(
+        !attempts.contains(&"/home/test/MISSING.md".to_owned()),
+        "no read issued for the absent candidate, got {attempts:?}"
+    );
+    assert!(
+        attempts.contains(&"/home/test/AGENTS.md".to_owned()),
+        "present candidates are still read"
+    );
+}
