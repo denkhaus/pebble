@@ -1384,7 +1384,7 @@ async fn favorites_keep_the_full_picker_and_cycle_in_saved_order_across_restart(
                 && screen.live_text().contains("openai/gpt-5.6-terra · 0 in")
         })
         .await;
-    terminal.send(b"\x0csol\r").await;
+    terminal.send(b"\x0cgpt-5.6-sol\r").await;
     terminal
         .until(|screen| {
             screen.cursor_line() == "› keep draft"
