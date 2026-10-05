@@ -29,7 +29,6 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::fs as async_fs;
 use tokio::io::AsyncWriteExt as _;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 #[path = "support/terminal.rs"]
@@ -39,7 +38,7 @@ use tokio::time::timeout;
 )]
 mod terminal;
 
-use terminal::Terminal;
+use terminal::{Terminal, child_command};
 
 const DONE: &str = "TERMINAL-APPROVAL-DONE";
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -58,12 +57,8 @@ async fn launch_terminal_child() {
     let args: Vec<String> = serde_json::from_str(&args).expect("fixture arguments");
     setsid().expect("detach child from runner terminal");
     let root = Path::new(&args[1]);
-    let level = match args[2].as_str() {
-        "read-only" => PermissionLevel::ReadOnly,
-        "read-write" => PermissionLevel::ReadWrite,
-        "full" => PermissionLevel::Full,
-        _ => panic!("known fixture permission"),
-    };
+    let level: PermissionLevel =
+        serde_json::from_value(Value::String(args[2].clone())).expect("known fixture permission");
     let scenario = &args[3];
     let aliases = scenario == "aliases";
     let (write, edit, shell) = if aliases {
@@ -103,24 +98,17 @@ async fn launch_terminal_child() {
     calls.push(ScriptedCall::response(text_response(
         "permission sequence complete",
     )));
-    let (builder, provider) = scripted_client_builder(ScriptedProvider::new(calls));
-    let catalog = Catalog::builder()
-        .overlay_toml(&TEST_CATALOG.replace(
-            "profile = \"anthropic\"",
-            if aliases {
-                "profile = \"kimi\""
-            } else {
-                "profile = \"anthropic\""
-            },
-        ))
-        .expect("fixture catalog layer")
-        .build()
-        .expect("fixture catalog");
-    let client = builder
-        .catalog(catalog)
-        .build()
-        .expect("scripted client")
-        .client;
+    let (mut builder, provider) = scripted_client_builder(ScriptedProvider::new(calls));
+    if aliases {
+        // The Kimi profile exposes the native tools as `Write`, `Edit`, and `Bash`.
+        let catalog = Catalog::builder()
+            .overlay_toml(&TEST_CATALOG.replace("profile = \"anthropic\"", "profile = \"kimi\""))
+            .expect("fixture catalog layer")
+            .build()
+            .expect("fixture catalog");
+        builder = builder.catalog(catalog);
+    }
+    let client = builder.build().expect("scripted client").client;
     let environment = LocalEnvironment::new(root);
     environment
         .prepare()
@@ -404,19 +392,10 @@ async fn noninteractive_levels_ignore_piped_approval_answers() {
         PermissionLevel::Full,
     ] {
         let root = TempDir::new().unwrap();
-        let mut child = Command::new(env::current_exe().unwrap())
-            .args(["--exact", "launch_terminal_child", "--nocapture"])
-            .env_clear()
-            .env("PATH", env::var_os("PATH").unwrap_or_default())
-            .env("PEBBLE_HOME", root.path())
-            .env(
-                "PEBBLE_PTY_ARGS",
-                serde_json::to_string(&arguments(root.path(), level, "writes-shell")).unwrap(),
-            )
+        let mut child = child_command(&arguments(root.path(), level, "writes-shell"), root.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
             .spawn()
             .unwrap();
         child
