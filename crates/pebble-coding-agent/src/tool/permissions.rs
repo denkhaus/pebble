@@ -166,6 +166,27 @@ impl PermissionLevelPolicy {
     pub const fn new(level: PermissionLevel) -> Self {
         Self { level }
     }
+
+    /// The least level that runs `tool` without asking.
+    ///
+    /// The tool is judged by its canonical identity, not the name a profile
+    /// exposes it under, so an extension that reuses a native alias such as
+    /// `Write` still needs [`PermissionLevel::Full`].
+    #[must_use]
+    pub fn required_level(tool: &pebble_agent::ToolDescriptor) -> PermissionLevel {
+        let category = gate_category(tool);
+        [PermissionLevel::ReadOnly, PermissionLevel::ReadWrite]
+            .into_iter()
+            .find(|level| level.auto_approves(category))
+            .unwrap_or(PermissionLevel::Full)
+    }
+}
+
+/// The permission-gate category of a tool, by its canonical identity.
+fn gate_category(tool: &pebble_agent::ToolDescriptor) -> ToolCategory {
+    NativeTool::from_canonical_name(tool.id().as_str())
+        .and_then(NativeTool::category)
+        .unwrap_or(ToolCategory::Shell)
 }
 
 impl ToolPermissionPolicy for PermissionLevelPolicy {
@@ -174,10 +195,7 @@ impl ToolPermissionPolicy for PermissionLevelPolicy {
         _session: &SessionScope,
         tool: &pebble_agent::ToolDescriptor,
     ) -> ToolPermission {
-        let category = NativeTool::from_canonical_name(tool.id().as_str())
-            .and_then(NativeTool::category)
-            .unwrap_or(ToolCategory::Shell);
-        if self.level.auto_approves(category) {
+        if self.level.auto_approves(gate_category(tool)) {
             ToolPermission::Allow
         } else {
             ToolPermission::RequireApproval
@@ -501,6 +519,47 @@ mod tests {
                     "{level} should{} auto-approve {category}",
                     if expected { "" } else { " not" }
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn the_required_level_follows_the_tool_identity() {
+        for (identity, name, expected) in [
+            ("read_file", "Read", PermissionLevel::ReadOnly),
+            ("spawn_agent", "spawn_agent", PermissionLevel::ReadOnly),
+            ("write_file", "Write", PermissionLevel::ReadWrite),
+            ("edit_file", "Edit", PermissionLevel::ReadWrite),
+            ("apply_patch", "apply_patch", PermissionLevel::ReadWrite),
+            ("shell", "Bash", PermissionLevel::Full),
+            ("web_search", "WebSearch", PermissionLevel::Full),
+            ("web_fetch", "FetchURL", PermissionLevel::Full),
+            ("unknown", "unknown", PermissionLevel::Full),
+            (
+                "mcp__files__write",
+                "mcp__files__write",
+                PermissionLevel::Full,
+            ),
+            // An extension that reuses a native alias is not that native tool.
+            ("Write", "Write", PermissionLevel::Full),
+            ("Read", "Read", PermissionLevel::Full),
+        ] {
+            let tool = ToolDescriptor::new(
+                ToolId::try_new(identity).expect("valid fixture identity"),
+                ToolDefinition::function(name, "Fixture tool", json!({"type": "object"})),
+            );
+            let required = PermissionLevelPolicy::required_level(&tool);
+            assert_eq!(required, expected, "{identity} exposed as {name}");
+            for level in [
+                PermissionLevel::ReadOnly,
+                PermissionLevel::ReadWrite,
+                PermissionLevel::Full,
+            ] {
+                let allowed = matches!(
+                    PermissionLevelPolicy::new(level).permission(&SessionScope::default(), &tool),
+                    ToolPermission::Allow
+                );
+                assert_eq!(allowed, level >= required, "{identity} at {level}");
             }
         }
     }
