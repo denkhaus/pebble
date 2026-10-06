@@ -66,11 +66,15 @@ async fn launch_terminal_child() {
     } else {
         ("write_file", "edit_file", "shell")
     };
-    let mut calls = match scenario.as_str() {
-        "shell-always" => vec![shell_call(shell, "shell-first", "shell-first.txt")],
-        "mcp-always" => vec![call("mcp__files__write", "extension", json!({}))],
-        "extension-alias" => vec![call("Write", "extension", json!({}))],
-        _ => Vec::new(),
+    let extension = match scenario.as_str() {
+        "mcp-always" => Some("mcp__files__write"),
+        "extension-alias" => Some("Write"),
+        _ => None,
+    };
+    let mut calls = if scenario == "shell-always" {
+        vec![shell_call(shell, "shell-first", "shell-first.txt")]
+    } else {
+        extension.map_or_else(Vec::new, |name| vec![call(name, "extension", json!({}))])
     };
     let path_key = if aliases { "path" } else { "file_path" };
     calls.push(call(
@@ -120,12 +124,7 @@ async fn launch_terminal_child() {
     let mut builder = CodingAgent::builder(client, Arc::new(environment))
         .model("test/model")
         .tool_middleware(Arc::new(middleware));
-    if matches!(scenario.as_str(), "mcp-always" | "extension-alias") {
-        let name = if scenario == "mcp-always" {
-            "mcp__files__write"
-        } else {
-            "Write"
-        };
+    if let Some(name) = extension {
         let marker = root.join("extension.txt");
         builder = builder.tools([RegisteredTool::function(
             name,
@@ -222,8 +221,13 @@ fn marker(root: &Path, name: &str, expected: Option<&str>) {
     }
 }
 
-async fn answer(terminal: &mut Terminal, tool: &str, response: &[u8]) {
-    terminal.contains(&format!("Allow {tool}?")).await;
+/// Answers the `nth` prompt for `tool`. Counting prompts keeps an answer from
+/// landing on an earlier prompt for the same tool that is still on screen.
+async fn answer(terminal: &mut Terminal, tool: &str, nth: usize, response: &[u8]) {
+    let prompt = format!("Allow {tool}?");
+    terminal
+        .until(|screen| screen.text().matches(prompt.as_str()).count() == nth)
+        .await;
     terminal.contains("Choice: ").await;
     terminal.send(response).await;
 }
@@ -238,7 +242,7 @@ async fn write_always_allows_another_write_but_shell_still_requires_approval() {
     terminal
         .contains("shell, web and MCP still require approval")
         .await;
-    answer(&mut terminal, "write_file", b"a\n").await;
+    answer(&mut terminal, "write_file", 1, b"a\n").await;
     terminal
         .contains("Allow shell? Current permission: read-write.")
         .await;
@@ -248,7 +252,7 @@ async fn write_always_allows_another_write_but_shell_still_requires_approval() {
     terminal
         .contains("ALL tools, including shell, web and MCP")
         .await;
-    answer(&mut terminal, "shell", b"n\n").await;
+    answer(&mut terminal, "shell", 1, b"n\n").await;
     let screen = terminal.finish_with(DONE, true).await;
     assert_eq!(screen.text().matches("Allow write_file?").count(), 1);
     assert_eq!(screen.text().matches("Allow shell?").count(), 1);
@@ -269,13 +273,9 @@ async fn write_always_allows_another_write_but_shell_still_requires_approval() {
 async fn write_always_covers_edits_and_shell_yes_does_not_grant_full() {
     let root = TempDir::new().unwrap();
     let mut terminal = start(root.path(), PermissionLevel::ReadOnly, "write-edit");
-    answer(&mut terminal, "write_file", b"always\n").await;
-    answer(&mut terminal, "shell", b"yes\n").await;
-    // Wait for the first call's effect before looking for a repeated prompt.
-    terminal
-        .until(|screen| screen.text().matches("Allow shell?").count() == 2)
-        .await;
-    terminal.send(b"no\n").await;
+    answer(&mut terminal, "write_file", 1, b"always\n").await;
+    answer(&mut terminal, "shell", 1, b"yes\n").await;
+    answer(&mut terminal, "shell", 2, b"no\n").await;
     terminal.finish_with(DONE, true).await;
     marker(root.path(), "second.txt", Some("edited"));
     marker(root.path(), "shell-last.txt", Some("shell"));
@@ -290,12 +290,9 @@ async fn write_always_covers_edits_and_shell_yes_does_not_grant_full() {
 async fn yes_once_and_denial_do_not_upgrade_the_session() {
     let root = TempDir::new().unwrap();
     let mut terminal = start(root.path(), PermissionLevel::ReadOnly, "writes-shell");
-    answer(&mut terminal, "write_file", b"y\n").await;
-    terminal
-        .until(|screen| screen.text().matches("Allow write_file?").count() == 2)
-        .await;
-    terminal.send(b"n\n").await;
-    answer(&mut terminal, "shell", b"n\n").await;
+    answer(&mut terminal, "write_file", 1, b"y\n").await;
+    answer(&mut terminal, "write_file", 2, b"n\n").await;
+    answer(&mut terminal, "shell", 1, b"n\n").await;
     terminal.finish_with(DONE, true).await;
     marker(root.path(), "first.txt", Some("first"));
     marker(root.path(), "second.txt", None);
@@ -311,12 +308,9 @@ async fn yes_once_and_denial_do_not_upgrade_the_session() {
 async fn empty_invalid_and_terminal_eof_answers_deny_without_upgrading() {
     let root = TempDir::new().unwrap();
     let mut terminal = start(root.path(), PermissionLevel::ReadOnly, "writes-shell");
-    answer(&mut terminal, "write_file", b"\n").await;
-    terminal
-        .until(|screen| screen.text().matches("Allow write_file?").count() == 2)
-        .await;
-    terminal.send(b"invalid\n").await;
-    answer(&mut terminal, "shell", b"\x04").await;
+    answer(&mut terminal, "write_file", 1, b"\n").await;
+    answer(&mut terminal, "write_file", 2, b"invalid\n").await;
+    answer(&mut terminal, "shell", 1, b"\x04").await;
     terminal.finish_with(DONE, true).await;
     marker(root.path(), "first.txt", None);
     marker(root.path(), "second.txt", None);
@@ -329,8 +323,8 @@ async fn native_profile_aliases_use_the_write_scope() {
     let root = TempDir::new().unwrap();
     let mut terminal = start(root.path(), PermissionLevel::ReadOnly, "aliases");
     terminal.contains("[a]lways: read-write").await;
-    answer(&mut terminal, "Write", b"a\n").await;
-    answer(&mut terminal, "Bash", b"n\n").await;
+    answer(&mut terminal, "Write", 1, b"a\n").await;
+    answer(&mut terminal, "Bash", 1, b"n\n").await;
     let screen = terminal.finish_with(DONE, true).await;
     assert_eq!(screen.text().matches("Allow Write?").count(), 1);
     assert!(!screen.text().contains("Allow Edit?"));
@@ -353,7 +347,7 @@ async fn shell_mcp_and_native_named_extensions_offer_full_explicitly() {
         terminal
             .contains("ALL tools, including shell, web and MCP")
             .await;
-        answer(&mut terminal, tool, b"a\n").await;
+        answer(&mut terminal, tool, 1, b"a\n").await;
         let screen = terminal.finish_with(DONE, true).await;
         assert_eq!(screen.text().matches("Allow ").count(), 1);
         assert!(outcomes(root.path()).iter().all(|(_, denied)| !denied));
@@ -370,16 +364,13 @@ async fn shell_mcp_and_native_named_extensions_offer_full_explicitly() {
 async fn a_fresh_session_does_not_remember_always() {
     let root = TempDir::new().unwrap();
     let mut terminal = start(root.path(), PermissionLevel::ReadOnly, "shell-always");
-    answer(&mut terminal, "shell", b"a\n").await;
+    answer(&mut terminal, "shell", 1, b"a\n").await;
     terminal.finish_with(DONE, true).await;
     let root = TempDir::new().unwrap();
     let mut terminal = start(root.path(), PermissionLevel::ReadOnly, "writes-shell");
-    answer(&mut terminal, "write_file", b"n\n").await;
-    terminal
-        .until(|screen| screen.text().matches("Allow write_file?").count() == 2)
-        .await;
-    terminal.send(b"n\n").await;
-    answer(&mut terminal, "shell", b"n\n").await;
+    answer(&mut terminal, "write_file", 1, b"n\n").await;
+    answer(&mut terminal, "write_file", 2, b"n\n").await;
+    answer(&mut terminal, "shell", 1, b"n\n").await;
     terminal.finish_with(DONE, true).await;
     assert!(outcomes(root.path()).iter().all(|(_, denied)| *denied));
 }

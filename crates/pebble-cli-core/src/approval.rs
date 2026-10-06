@@ -5,7 +5,7 @@ use std::io::{self, Write as _};
 use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
-use pebble_agent::{ToolCallRequest, ToolDescriptor, ToolSystemError};
+use pebble_agent::{ToolCallRequest, ToolSystemError};
 use pebble_coding_agent::tools::{
     ApprovalDecision, PermissionLevel, PermissionLevelPolicy, ToolApprovalService,
 };
@@ -40,39 +40,10 @@ impl TerminalApproval {
         *self.level.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn raise_level(&self, escalation: Escalation) {
+    fn raise_level(&self, required: PermissionLevel) {
         let mut level = self.level.lock().unwrap_or_else(PoisonError::into_inner);
         // Another approval may have raised the level while this prompt waited.
-        *level = (*level).max(escalation.level());
-    }
-}
-
-/// The step up the ladder one tool call needs. It is made only from the call,
-/// so answering "always" never grants more than that call required.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Escalation {
-    ReadWrite,
-    Full,
-}
-
-impl Escalation {
-    /// The step `tool` needs from `current`, or `None` when `current` already
-    /// allows it.
-    fn needed(current: PermissionLevel, tool: &ToolDescriptor) -> Option<Self> {
-        match PermissionLevelPolicy::required_level(tool) {
-            required if required <= current => None,
-            PermissionLevel::ReadWrite => Some(Self::ReadWrite),
-            PermissionLevel::Full => Some(Self::Full),
-            // Every level allows what read-only allows.
-            PermissionLevel::ReadOnly => None,
-        }
-    }
-
-    const fn level(self) -> PermissionLevel {
-        match self {
-            Self::ReadWrite => PermissionLevel::ReadWrite,
-            Self::Full => PermissionLevel::Full,
-        }
+        *level = (*level).max(required);
     }
 }
 
@@ -82,24 +53,27 @@ impl ToolApprovalService for TerminalApproval {
         &self,
         request: &ToolCallRequest,
     ) -> Result<ApprovalDecision, ToolSystemError> {
-        let tool_name = request.call().name.clone();
+        // Judged from the call alone, so answering "always" never grants more
+        // than this call required.
+        let required = PermissionLevelPolicy::required_level(request.descriptor());
         let current = self.level();
-        let Some(escalation) = Escalation::needed(current, request.descriptor()) else {
+        if required <= current {
             return Ok(ApprovalDecision::Allow);
-        };
+        }
+        let tool_name = &request.call().name;
         if !self.interactive {
             return Ok(ApprovalDecision::Deny {
                 reason: format!("{tool_name} tool denied at current permission level"),
             });
         }
         let asked = tool_name.clone();
-        let answer = spawn_blocking(move || ask(&asked, current, escalation))
+        let answer = spawn_blocking(move || ask(&asked, current, required))
             .await
             .map_err(|error| ToolSystemError::new(format!("approval prompt failed: {error}")))?;
         Ok(match answer {
             Ok(Answer::Allow) => ApprovalDecision::Allow,
             Ok(Answer::AllowAlways) => {
-                self.raise_level(escalation);
+                self.raise_level(required);
                 ApprovalDecision::Allow
             }
             Ok(Answer::Deny) => ApprovalDecision::Deny {
@@ -126,9 +100,9 @@ enum Answer {
 fn ask(
     tool_name: &str,
     current: PermissionLevel,
-    escalation: Escalation,
+    required: PermissionLevel,
 ) -> Result<Answer, String> {
-    eprint!("{}", prompt(tool_name, current, escalation));
+    eprint!("{}", prompt(tool_name, current, required));
     io::stderr().flush().ok();
     let mut input = String::new();
     io::stdin()
@@ -145,16 +119,16 @@ fn parse_answer(input: &str) -> Answer {
     }
 }
 
-fn prompt(tool_name: &str, current: PermissionLevel, escalation: Escalation) -> String {
-    let target = escalation.level();
-    let scope = match escalation {
-        Escalation::ReadWrite => "All read/write tools; shell, web and MCP still require approval.",
-        Escalation::Full => "ALL tools, including shell, web and MCP.",
+fn prompt(tool_name: &str, current: PermissionLevel, required: PermissionLevel) -> String {
+    let scope = if required == PermissionLevel::Full {
+        "ALL tools, including shell, web and MCP."
+    } else {
+        "All read/write tools; shell, web and MCP still require approval."
     };
     format!(
         "Allow {tool_name}? Current permission: {current}.\n\
          [y]es: this call only / [n]o: deny this call\n\
-         [a]lways: {target} for the rest of this session\n\
+         [a]lways: {required} for the rest of this session\n\
          {scope}\nChoice: "
     )
 }
@@ -182,38 +156,17 @@ mod tests {
     }
 
     #[test]
-    fn a_call_escalates_only_as_far_as_its_tool_requires() {
-        use PermissionLevel::{Full, ReadOnly, ReadWrite};
-        for (identity, current, expected) in [
-            ("read_file", ReadOnly, None),
-            ("write_file", ReadOnly, Some(Escalation::ReadWrite)),
-            ("write_file", ReadWrite, None),
-            ("shell", ReadOnly, Some(Escalation::Full)),
-            ("shell", ReadWrite, Some(Escalation::Full)),
-            ("shell", Full, None),
-            ("mcp__files__write", ReadWrite, Some(Escalation::Full)),
-        ] {
-            let request = request(identity, identity);
-            assert_eq!(
-                Escalation::needed(current, request.descriptor()),
-                expected,
-                "{identity} at {current}"
-            );
-        }
-    }
-
-    #[test]
     fn the_prompt_states_the_scope_of_always() {
         let text = prompt(
             "write_file",
             PermissionLevel::ReadOnly,
-            Escalation::ReadWrite,
+            PermissionLevel::ReadWrite,
         );
         assert!(text.contains("Current permission: read-only."));
         assert!(text.contains("this call only"));
         assert!(text.contains("[a]lways: read-write for the rest of this session"));
         assert!(text.contains("shell, web and MCP still require approval"));
-        let text = prompt("shell", PermissionLevel::ReadWrite, Escalation::Full);
+        let text = prompt("shell", PermissionLevel::ReadWrite, PermissionLevel::Full);
         assert!(text.contains("[a]lways: full for the rest of this session"));
         assert!(text.contains("ALL tools, including shell, web and MCP"));
     }
@@ -225,10 +178,10 @@ mod tests {
             PermissionLevel::ReadWrite,
             PermissionLevel::Full,
         ] {
-            for escalation in [Escalation::ReadWrite, Escalation::Full] {
+            for required in [PermissionLevel::ReadWrite, PermissionLevel::Full] {
                 let approval = TerminalApproval::new(current, true);
-                approval.raise_level(escalation);
-                assert_eq!(approval.level(), current.max(escalation.level()));
+                approval.raise_level(required);
+                assert_eq!(approval.level(), current.max(required));
             }
         }
     }
