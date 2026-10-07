@@ -1,0 +1,208 @@
+name: Internal dependencies
+
+# Every internal Git dependency names `branch = "main"`, and Cargo.lock picks
+# the commit CI builds. Each night this job moves the lock to the current main
+# of each internal library with `cargo update -p`, then runs the routine gate
+# against it, so drift is noticed without anyone asking. A failure opens one
+# tracking issue labeled `internal-deps`, or comments on the open one; the
+# next passing run closes it. Nothing is pushed: Pebble's lock only decides
+# what Pebble's own CI builds, so a maintainer picks up a passing update with
+# the same `cargo update -p` commands.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+# Never cancel a run midway: the report job must see how the check ended.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.update.outputs.changed }}
+      summary: ${{ steps.update.outputs.summary }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install locked tools
+        id: install_mise
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
+        with:
+          version: 2026.6.11
+          install_args: --locked --jobs=1
+
+      # mise-action caches Mise's Rust symlinks, but not the Rustup toolchains
+      # behind them. Refresh Rust so its configured components are present.
+      - name: Refresh cached Rust toolchains
+        if: steps.install_mise.outputs.cache-hit == 'true'
+        run: mise install --locked --force --jobs=1 rust
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+          shared-key: internal-deps-ubuntu-24.04
+
+      # One package per internal repository: updating one package from a Git
+      # repository moves every package from that repository. The summary names
+      # each repository whose locked commit moved, for the job summary and the
+      # tracking issue.
+      - name: Update internal dependencies
+        id: update
+        env:
+          INTERNAL_CRATES: lithos-llm sandbox-driver twin-openai
+        run: |
+          set -euo pipefail
+          cp Cargo.lock "$RUNNER_TEMP/Cargo.lock.before"
+          args=()
+          for crate in $INTERNAL_CRATES; do
+            args+=(-p "$crate")
+          done
+          cargo update "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/cargo-update.log"
+
+          python3 - "$RUNNER_TEMP/Cargo.lock.before" Cargo.lock > "$RUNNER_TEMP/summary.md" <<'PY'
+          import re
+          import sys
+          import tomllib
+
+          SOURCE = re.compile(r"git\+https://github\.com/([^?#]+?)(?:\.git)?\?[^#]*#([0-9a-f]+)$")
+
+          def commits(path):
+              found = {}
+              with open(path, "rb") as lock:
+                  for package in tomllib.load(lock).get("package", []):
+                      match = SOURCE.match(package.get("source", ""))
+                      if match:
+                          found.setdefault(match[1], set()).add(match[2])
+              return found
+
+          before, after = commits(sys.argv[1]), commits(sys.argv[2])
+          rows = []
+          for repo in sorted(set(before) | set(after)):
+              old, new = sorted(before.get(repo, ())), sorted(after.get(repo, ()))
+              if old == new:
+                  continue
+              if len(old) == 1 and len(new) == 1:
+                  moved = f"[`{old[0][:7]}...{new[0][:7]}`](https://github.com/{repo}/compare/{old[0]}...{new[0]})"
+              else:
+                  moved = " ".join(f"`{c[:7]}`" for c in old) + " -> " + " ".join(f"`{c[:7]}`" for c in new)
+              rows.append(f"| `{repo}` | {moved} |")
+          if rows:
+              print("| Repository | Commits |\n|---|---|")
+              print("\n".join(rows))
+          else:
+              print("No internal commit moved.")
+          PY
+          {
+            echo
+            echo "<details><summary>cargo update output</summary>"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/cargo-update.log"
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$RUNNER_TEMP/summary.md"
+          cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+          # Only a moved internal commit counts: `cargo update` can also
+          # rewrite unrelated entries of a lock that `--locked` accepts.
+          if grep -q '^| `' "$RUNNER_TEMP/summary.md"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            git checkout -- Cargo.lock
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Cargo.lock already locks every internal main; nothing to do."
+          fi
+          delimiter="SUMMARY_$(openssl rand -hex 16)"
+          {
+            echo "summary<<$delimiter"
+            cat "$RUNNER_TEMP/summary.md"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify routine checks
+        if: steps.update.outputs.changed == 'true'
+        run: mise run check
+
+      # A newer library can raise the compiler floor; the nightly gate checks
+      # the declared minimum, so check it here too.
+      - name: Check the minimum Rust version
+        if: steps.update.outputs.changed == 'true'
+        run: mise run check:msrv
+
+  report:
+    name: report
+    needs: check
+    if: always() && (needs.check.result == 'success' || needs.check.result == 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      issues: write # open, comment on, and close the tracking issue; create its label
+    steps:
+      - name: Update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ needs.check.result }}
+          CHANGED: ${{ needs.check.outputs.changed }}
+          SUMMARY: ${{ needs.check.outputs.summary }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          label=internal-deps
+          repo_api="repos/$GITHUB_REPOSITORY"
+          issue="$(gh api "$repo_api/issues?labels=$label&state=open&per_page=100" \
+            --jq '[.[] | select(.pull_request == null)] | sort_by(.number) | .[0].number // empty')"
+          body="$RUNNER_TEMP/body.md"
+
+          if [ "$RESULT" = "success" ]; then
+            if [ "$CHANGED" = "true" ]; then
+              echo "The updated lock passed the routine checks; nothing is pushed." >> "$GITHUB_STEP_SUMMARY"
+            fi
+            if [ -n "$issue" ]; then
+              {
+                echo "The nightly internal dependency update passed again: $RUN_URL"
+                echo
+                echo "${SUMMARY:-No summary was recorded.}"
+              } > "$body"
+              gh api "$repo_api/issues/$issue/comments" -F body=@"$body" --silent
+              gh api -X PATCH "$repo_api/issues/$issue" -f state=closed -f state_reason=completed --silent
+              echo "Closed #$issue."
+            fi
+            exit 0
+          fi
+
+          {
+            echo "The nightly internal dependency update failed: $RUN_URL"
+            echo
+            echo "It moved Cargo.lock to the current main of each internal library with \`cargo update -p\` and ran the routine checks against it. Whoever broke an API this repository uses fixes it here promptly."
+            echo
+            echo "${SUMMARY:-No summary was recorded: the run failed before \`cargo update\` finished.}"
+          } > "$body"
+          if [ -n "$issue" ]; then
+            gh api "$repo_api/issues/$issue/comments" -F body=@"$body" --silent
+            echo "Commented on #$issue."
+          else
+            if ! gh api "$repo_api/labels/$label" --silent 2>/dev/null; then
+              gh api "$repo_api/labels" -f name="$label" -f color=d93f0b \
+                -f description="Nightly internal dependency update" --silent
+            fi
+            gh api "$repo_api/issues" -f title="Nightly internal dependency update failed" \
+              -F body=@"$body" -f "labels[]=$label" --jq '"Opened #\(.number)."'
+          fi

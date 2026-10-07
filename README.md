@@ -315,6 +315,16 @@ builds its own agent, with its own client, environment, tools, and settings,
 runs it through the same session and renderer instead of writing them again;
 fabro's `fabro exec` does.
 
+`TerminalApproval` keeps Pebble's three permission levels. Choosing "yes"
+allows only the current call. Choosing "always" grants the least level that
+allows the tool: `read-write` for native writes, `full` for shell, web, and
+unrecognized tools, including MCP. The prompt states that scope before asking.
+The grant applies to every tool allowed by that level for the lifetime of the
+approval-service instance, including sessions that share it; a fresh instance
+starts at its configured level. Noninteractive approval refuses calls outside
+the configured level. Pebble's own `exec` uses a fixed permission level, and
+its interactive UI uses separate per-call approvals.
+
 ## What an application has to supply
 
 **A client, with retry middleware.** Pebble takes a built `lithos_llm::Client`

@@ -28,6 +28,27 @@ pub(crate) struct Terminal {
     pub output: Vec<u8>,
 }
 
+/// The test binary re-run as `launch_terminal_child`, with a clean
+/// environment apart from `PATH`, `PEBBLE_HOME`, the child's arguments, and
+/// coverage output. The caller chooses its standard streams.
+pub(crate) fn child_command(args: &[String], home: &Path) -> Command {
+    let mut command = Command::new(env::current_exe().expect("test executable"));
+    command
+        .args(["--exact", "launch_terminal_child", "--nocapture"])
+        .env_clear()
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .env(
+            "PEBBLE_PTY_ARGS",
+            serde_json::to_string(args).expect("serialize args"),
+        )
+        .env("PEBBLE_HOME", home)
+        .kill_on_drop(true);
+    if let Some(profile) = env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    command
+}
+
 impl Terminal {
     pub(crate) fn start(args: &[String], base_url: &str, namespace: &str) -> Self {
         let cwd = args
@@ -76,32 +97,20 @@ impl Terminal {
             fcntl_getfl(&master).expect("get flags") | OFlags::NONBLOCK,
         )
         .expect("nonblocking master");
-        let mut command = Command::new(env::current_exe().expect("test executable"));
+        let mut command = child_command(args, home);
         command
-            .args(["--exact", "launch_terminal_child", "--nocapture"])
-            .env_clear()
-            .env("PATH", env::var_os("PATH").unwrap_or_default())
             .env("TERM", "xterm-256color")
             .env("NO_COLOR", "1")
-            .env(
-                "PEBBLE_PTY_ARGS",
-                serde_json::to_string(args).expect("serialize args"),
-            )
             .env("PEBBLE_OPENAI_BASE_URL", base_url)
-            .env("PEBBLE_HOME", home)
             .stdin(Stdio::from(slave.try_clone().expect("clone input")))
             .stdout(Stdio::from(slave.try_clone().expect("clone output")))
-            .stderr(Stdio::from(slave.try_clone().expect("clone errors")))
-            .kill_on_drop(true);
+            .stderr(Stdio::from(slave.try_clone().expect("clone errors")));
         if let Some(namespace) = namespace {
             command.env("OPENAI_API_KEY", namespace);
         }
         command.envs(extra.iter().copied());
         if extra.contains(&("PEBBLE_PTY_COLOR", "1")) {
             command.env_remove("NO_COLOR");
-        }
-        if let Some(profile) = env::var_os("LLVM_PROFILE_FILE") {
-            command.env("LLVM_PROFILE_FILE", profile);
         }
         let child = command.spawn().expect("launch terminal child");
         Self {

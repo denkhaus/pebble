@@ -89,10 +89,11 @@ pub struct ToolSummary {
 
 /// The permission ladder an embedder applies to a session's tools.
 ///
-/// Each level is a superset of the one before it. Pebble ships the ladder and
-/// an auto-approval table as an optional helper; the loop consults only the
+/// Each level is a superset of the one before it, and the levels order that
+/// way: `ReadOnly < ReadWrite < Full`. Pebble ships the ladder and an
+/// auto-approval table as an optional helper; the loop consults only the
 /// permission middleware an embedder installs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionLevel {
     /// Reads only.
