@@ -22,9 +22,9 @@ use std::time::SystemTime;
 
 use lithos_llm::Client;
 use lithos_llm::types::{Error as LlmError, ErrorKind as LlmErrorKind, ReasoningEffort, Speed};
-use pebble_agent::{Agent, AgentControlHandle, ToolMiddleware};
 #[cfg(test)]
 use pebble_agent::UserMessage;
+use pebble_agent::{Agent, AgentControlHandle, ToolMiddleware};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
