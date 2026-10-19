@@ -151,9 +151,9 @@ pub struct AgentConfig {
     /// The most tokens one model turn may produce.
     pub max_output_tokens: Option<u32>,
     /// The requested reasoning effort.
-    pub reasoning_effort:  Option<ReasoningEffort>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// The requested latency or cost tier.
-    pub speed:             Option<Speed>,
+    pub speed: Option<Speed>,
     /// Replay policy for a response stream that fails after it opens.
     ///
     /// The default waits one second before the first replay, doubles the wait
@@ -164,9 +164,9 @@ pub struct AgentConfig {
     /// millisecond schedule of [`RetryPolicy::exponential`] does not. A
     /// `Retry-After` from the provider replaces the computed wait; one longer
     /// than sixty seconds ends the replays instead.
-    pub turn_replay:       RetryPolicy,
+    pub turn_replay: RetryPolicy,
     /// Hard limit on replays after the first response stream opens.
-    pub max_turn_replays:  u32,
+    pub max_turn_replays: u32,
     /// The most tool rounds one prompt may run. `None` sets no limit.
     ///
     /// A tool round is one model turn that asks for tools, followed by the
@@ -180,25 +180,32 @@ pub struct AgentConfig {
     /// are answered as `Cancelled` without running, so history stays paired,
     /// and [`AgentEvent::ToolRoundsExhausted`] is emitted. With `Some(0)`,
     /// the first turn that asks for tools ends the prompt this way.
-    pub max_tool_rounds:   Option<usize>,
+    pub max_tool_rounds: Option<usize>,
+    /// The consecutive all-error tool rounds a prompt tolerates before it
+    /// ends with [`AgentError::ConsecutiveToolErrors`] (fabro-9c79). Every
+    /// result of each counted round was an error; a single successful
+    /// result resets the count. `Some(0)` never trips (a first round
+    /// cannot be consecutive); the default is 5.
+    pub max_consecutive_error_rounds: usize,
     /// Events held for each live subscriber.
-    pub event_capacity:    usize,
+    pub event_capacity: usize,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_output_tokens: None,
-            reasoning_effort:  None,
-            speed:             None,
-            turn_replay:       RetryPolicy::exponential()
+            reasoning_effort: None,
+            speed: None,
+            turn_replay: RetryPolicy::exponential()
                 .initial_delay(DEFAULT_REPLAY_INITIAL_DELAY)
                 .max_delay(DEFAULT_REPLAY_MAX_DELAY)
                 .jitter(true)
                 .max_attempts(DEFAULT_REPLAY_ATTEMPTS),
-            max_turn_replays:  3,
-            max_tool_rounds:   None,
-            event_capacity:    DEFAULT_EVENT_CAPACITY,
+            max_turn_replays: 3,
+            max_tool_rounds: None,
+            max_consecutive_error_rounds: 5,
+            event_capacity: DEFAULT_EVENT_CAPACITY,
         }
     }
 }
@@ -729,6 +736,9 @@ impl Agent {
         let mut turn_count = 0;
         let mut tool_call_count = 0;
         let mut tool_round_count = 0;
+        // fabro-9c79: consecutive rounds in which EVERY tool result was an
+        // error. A single successful result resets it.
+        let mut consecutive_error_rounds = 0usize;
 
         'prompt: loop {
             if let Some(message) = next_message.take() {
@@ -941,6 +951,42 @@ impl Agent {
                     .await;
                 let cancelled = prompt_cancel.is_cancelled() || round_cancel.is_cancelled();
                 self.commit_tool_results(&calls, &execution.results, cancelled);
+
+                // fabro-9c79: the repeat-until-interrupt backstop. A round
+                // where every result is an error counts; one success resets.
+                if !execution.results.is_empty()
+                    && execution.results.iter().all(|result| result.is_error)
+                {
+                    consecutive_error_rounds += 1;
+                    if consecutive_error_rounds >= self.config.max_consecutive_error_rounds {
+                        let first_error = execution
+                            .results
+                            .iter()
+                            .find(|result| result.is_error)
+                            .map(|result| {
+                                result
+                                    .content
+                                    .iter()
+                                    .filter_map(|part| match part {
+                                        ContentPart::Text { text } => Some(text.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_default();
+                        self.emit(AgentEvent::ConsecutiveToolErrors {
+                            rounds:      consecutive_error_rounds,
+                            first_error: first_error.clone(),
+                        });
+                        return Err(AgentError::ConsecutiveToolErrors {
+                            rounds: consecutive_error_rounds,
+                            first_error,
+                        });
+                    }
+                } else {
+                    consecutive_error_rounds = 0;
+                }
 
                 if let Some(source) = execution.system_error {
                     return Err(AgentError::ToolSystem { source });
@@ -1987,6 +2033,64 @@ mod tests {
             &tool_message.content()[0],
             ContentPart::ToolResult(result) if !result.is_error
         ));
+    }
+
+    /// fabro-9c79: a model that retries the same failing tool call forever
+    /// is stopped by the consecutive all-error round budget. The prompt
+    /// fails with the diagnostics after exactly the budget's rounds; one
+    /// successful result resets the count.
+    #[tokio::test]
+    async fn consecutive_all_error_rounds_end_the_prompt_with_diagnostics() {
+        let mut script: Vec<Response> = (0..10)
+            .map(|index| counting_call(&format!("call_{index}")))
+            .collect();
+        script.push(text_response("done"));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&executions);
+        let failing = Tool::function(
+            "count",
+            "Counts its executions",
+            json!({"type": "object"}),
+            move |_context, _arguments| {
+                let executions = Arc::clone(&counter);
+                async move {
+                    executions.fetch_add(1, Ordering::SeqCst);
+                    Err(ToolError::new("the tool returned an unsupported outcome"))
+                }
+            },
+        )
+        .expect("the failing counting tool is valid");
+        let mut agent = Agent::builder(ScriptedModel::new(script), "test/model")
+            .tools([failing])
+            .config(AgentConfig {
+                max_consecutive_error_rounds: 3,
+                ..AgentConfig::default()
+            })
+            .build()
+            .expect("the agent builds");
+        let mut events = agent.subscribe();
+
+        let error = agent.prompt("work").await.expect_err("the budget trips");
+        let AgentError::ConsecutiveToolErrors {
+            rounds,
+            first_error,
+        } = &error
+        else {
+            panic!("expected ConsecutiveToolErrors, got {error:?}");
+        };
+        assert_eq!(*rounds, 3, "exactly the budget's rounds ran");
+        assert!(
+            first_error.contains("unsupported outcome"),
+            "the diagnostics name the first error, got {first_error}"
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
+        let saw_event = &mut false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(&event, AgentEvent::ConsecutiveToolErrors { rounds: 3, .. }) {
+                *saw_event = true;
+            }
+        }
+        assert!(*saw_event, "the diagnostic event was published");
     }
 
     /// A response that asks for the counting tool once.

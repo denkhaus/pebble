@@ -80,6 +80,18 @@ pub enum AgentError {
         /// The configured limit, which is also how many rounds ran.
         limit: usize,
     },
+    /// The prompt hit its limit of consecutive tool rounds in which every
+    /// result was an error (the repeat-until-interrupt class, fabro-9c79:
+    /// a model that cannot see the error flag retried the same failing
+    /// call 176 times over four hours). The conversation is left paired;
+    /// [`AgentEvent::ConsecutiveToolErrors`] is emitted before the error.
+    #[error("the prompt hit its limit of {rounds} consecutive all-error tool rounds")]
+    ConsecutiveToolErrors {
+        /// The configured limit, which is also how many all-error rounds ran.
+        rounds:      usize,
+        /// The first error result's text, for diagnosis at the boundary.
+        first_error: String,
+    },
     /// The request could not be built from the current conversation.
     #[error("building the model request")]
     Request {

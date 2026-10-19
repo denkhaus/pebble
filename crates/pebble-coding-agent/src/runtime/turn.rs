@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use lithos_llm::middleware::CallContext;
 use lithos_llm::types::{
     ContentPart, Error as LlmError, FinishReason, Message as LlmMessage, Request, Response,
-    ResponseStream, ToolCall, ToolResult,
+    ResponseStream, Role, ToolCall, ToolResult,
 };
 use pebble_agent as agent;
 use serde_json::Value;
@@ -38,8 +38,8 @@ use crate::subagent::SubagentSupervisor;
 use crate::task_reminder::maybe_task_reminder;
 use crate::tool::{CodingToolService, NativeTool, canonical_tool_name};
 use crate::types::{
-    CodingAgentState, CodingEvent, ContextWindowSnapshot, ContextWindowStaleness, InputContent,
-    InputSource, LlmOutputKind, LlmRetryPhase, Message, SkillActivationSource, Usage,
+    AgentProfileKind, CodingAgentState, CodingEvent, ContextWindowSnapshot, ContextWindowStaleness,
+    InputContent, InputSource, LlmOutputKind, LlmRetryPhase, Message, SkillActivationSource, Usage,
 };
 use crate::{SessionId, SessionScope};
 
@@ -1044,6 +1044,22 @@ impl CodingRuntime {
             .unwrap_or_else(PoisonError::into_inner)
             .history
             .to_llm_messages();
+        // fabro-bb27: the openai chat wire has no error marker for tool
+        // messages, so a failed tool result reaches the model looking like a
+        // successful one (lithos openai_chat drops the flag with an
+        // unsupported_control warning). Models that read only the flag then
+        // retry the same failing call indefinitely (observed: 176 identical
+        // invalid-arguments calls over four hours, incident run
+        // 01M59MG9XS2A). For the openai-family profiles the flag is rendered
+        // INTO the content where no model can miss it.
+        let messages = if matches!(
+            self.model_context.profile_kind,
+            AgentProfileKind::OpenAi | AgentProfileKind::Gpt56 | AgentProfileKind::Gpt6
+        ) {
+            render_tool_error_flags_in_content(messages)
+        } else {
+            messages
+        };
         let config = agent::AgentConfig {
             max_output_tokens: max_output_tokens(&self.config, &self.model_context.facts),
             reasoning_effort: self.config.reasoning_effort,
@@ -1297,5 +1313,102 @@ mod tests {
 
         assert!(activated_a_skill(slice::from_ref(&call), &[ok]));
         assert!(!activated_a_skill(&[call], &[failed]));
+    }
+}
+
+/// fabro-bb27 (ADR fabro-c14e era): for openai-wire profiles, render the
+/// tool-result error flag into the content itself — a prefix no model can
+/// read as success. Native-flag protocols (Anthropic) keep the flag only.
+fn render_tool_error_flags_in_content(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
+    messages
+        .into_iter()
+        .map(|message| {
+            if message.role() != Role::Tool {
+                return message;
+            }
+            let mut parts = message.content().to_vec();
+            for part in &mut parts {
+                if let ContentPart::ToolResult(result) = part {
+                    if result.is_error && !result.content.is_empty() {
+                        for content in &mut result.content {
+                            if let ContentPart::Text { text } = content {
+                                if !text.starts_with("[TOOL ERROR]") {
+                                    text.insert_str(0, "[TOOL ERROR] ");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let mut rebuilt = LlmMessage::new(message.role(), parts);
+            if let Some(name) = message.name() {
+                rebuilt = rebuilt.with_name(name.to_owned());
+            }
+            if let Some(id) = message.tool_call_id() {
+                rebuilt = rebuilt.with_tool_call_id(id.to_owned());
+            }
+            rebuilt
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tool_error_flag_wrap_tests {
+    use lithos_llm::types::{ContentPart, Message as LlmMessage, Role, ToolResult};
+
+    use super::render_tool_error_flags_in_content;
+
+    fn error_result(text: &str, is_error: bool) -> ContentPart {
+        ContentPart::ToolResult(ToolResult {
+            tool_call_id: "call_1".into(),
+            name: Some("count".into()),
+            content: vec![ContentPart::Text { text: text.into() }],
+            is_error,
+        })
+    }
+
+    /// fabro-bb27: an error-marked tool result gains the [TOOL ERROR]
+    /// prefix; a successful one is untouched; a non-tool message is
+    /// untouched and keeps its metadata.
+    #[test]
+    fn error_flags_render_into_content() {
+        let tool_message = LlmMessage::new(Role::Tool, [
+            error_result("boom", true),
+            error_result("fine", false),
+        ])
+        .with_tool_call_id("call_1");
+        let user_message = LlmMessage::new(Role::User, [ContentPart::Text { text: "hi".into() }]);
+        let wrapped = render_tool_error_flags_in_content(vec![tool_message, user_message]);
+        assert_eq!(wrapped[0].tool_call_id(), Some("call_1"));
+        let ContentPart::ToolResult(first) = &wrapped[0].content()[0] else {
+            panic!("first part is the error result");
+        };
+        let ContentPart::Text { text } = &first.content[0] else {
+            panic!("error content is text");
+        };
+        assert_eq!(text, "[TOOL ERROR] boom");
+        let ContentPart::ToolResult(second) = &wrapped[0].content()[1] else {
+            panic!("second part is the success result");
+        };
+        let ContentPart::Text { text } = &second.content[0] else {
+            panic!("success content is text");
+        };
+        assert_eq!(text, "fine");
+        assert_eq!(wrapped[1].role(), Role::User);
+    }
+
+    /// fabro-bb27: a result already carrying the prefix is not prefixed
+    /// again on a replayed conversation.
+    #[test]
+    fn an_existing_prefix_is_not_doubled() {
+        let message = LlmMessage::new(Role::Tool, [error_result("[TOOL ERROR] boom", true)]);
+        let wrapped = render_tool_error_flags_in_content(vec![message]);
+        let ContentPart::ToolResult(result) = &wrapped[0].content()[0] else {
+            panic!("tool result");
+        };
+        let ContentPart::Text { text } = &result.content[0] else {
+            panic!("text");
+        };
+        assert_eq!(text, "[TOOL ERROR] boom");
     }
 }

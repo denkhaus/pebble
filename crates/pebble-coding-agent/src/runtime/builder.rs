@@ -670,6 +670,7 @@ impl ResolvedModel {
             model: self.handle.model().as_str().to_owned(),
             model_selector: self.handle.to_string(),
             facts: self.facts,
+            profile_kind: self.kind,
         }
     }
 }

@@ -124,6 +124,14 @@ pub enum AgentEvent {
         /// The configured limit, which is also how many rounds ran.
         limit: usize,
     },
+    /// The prompt hit its limit of consecutive all-error tool rounds
+    /// ([`AgentError::ConsecutiveToolErrors`], fabro-9c79).
+    ConsecutiveToolErrors {
+        /// The configured limit, which is also how many all-error rounds ran.
+        rounds:      usize,
+        /// The first error result's text.
+        first_error: String,
+    },
     /// The prompt and all queued follow-up input completed.
     PromptCompleted {
         /// The final response.

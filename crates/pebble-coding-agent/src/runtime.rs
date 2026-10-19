@@ -163,6 +163,9 @@ struct SessionModel {
     model:          String,
     model_selector: String,
     facts:          ModelFacts,
+    /// The harness profile this session drives - gates protocol
+    /// compensation such as the openai-wire tool-error wrap (fabro-bb27).
+    profile_kind:   AgentProfileKind,
 }
 
 /// Resources prepared at initialization and shared unchanged with the bridge.
