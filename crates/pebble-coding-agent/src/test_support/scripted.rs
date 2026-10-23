@@ -115,6 +115,15 @@ profile = "anthropic"
 display_name = "Inherited"
 api_model = "inherited"
 
+# A tools-capable row that names no profile of its own, so it inherits the
+# provider's `openai`: the openai-wire arm of harness-conditional behavior
+# (the tool-error wrap, fabro-c98c) with tools in play.
+[providers.test.models.openai-tools]
+display_name = "OpenAI-wire tools model"
+api_model = "openai-tools"
+capabilities = { text = true, tools = true }
+limits = { context_tokens = 200000, max_output_tokens = 32000 }
+
 [providers.test.models.strange]
 display_name = "Strange"
 api_model = "strange"

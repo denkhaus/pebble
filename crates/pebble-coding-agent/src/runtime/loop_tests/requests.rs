@@ -5,7 +5,7 @@
 //! the scripted provider captured, which is the only place the session's own
 //! decisions about a round are visible.
 
-use lithos_llm::types::{Message as LlmMessage, ReasoningEffort, Request, Role};
+use lithos_llm::types::{ContentPart, Message as LlmMessage, ReasoningEffort, Request, Role};
 use pebble_agent::{
     ToolCallNext, ToolCallRequest, ToolDescriptor, ToolMiddleware, ToolOutcome, ToolSystemError,
 };
@@ -143,6 +143,65 @@ async fn a_session_with_no_prompt_sends_no_system_message() {
         request.messages().first().map(LlmMessage::role),
         Some(Role::User),
         "the input is the first thing the model reads"
+    );
+}
+
+/// fabro-c98c: the openai-wire error-flag wrap must ride the REQUEST, not
+/// the first agent build — a tool result that fails mid-session reaches the
+/// next request rendered, or the openai wire drops the flag and the model
+/// reads the failure as success (the mimo tool-loop incident class: 176
+/// identical failing calls the model could not see). The test catalog's
+/// `openai-tools` row names no profile of its own, so it inherits the
+/// provider's `openai` — the same profile kind zai resolves to, which is
+/// what the production loop lane runs under.
+#[tokio::test]
+async fn a_mid_session_failed_tool_result_is_wrapped_in_the_next_request() {
+    let (mut session, provider) = TestSession::new(vec![
+        ScriptedCall::response(tool_call_response("fail_tool", "call_1", json!({}))),
+        ScriptedCall::response(text_response("recovered")),
+    ])
+    .model("test/openai-tools")
+    .tools([failing_tool()])
+    .build();
+
+    session
+        .prompt("Use fail tool")
+        .await
+        .expect("the prompt succeeds");
+
+    let requests = provider.requests();
+    let second = requests.get(1).expect("the round after the failure");
+    let tool_message = second
+        .messages()
+        .iter()
+        .rev()
+        .find(|message| message.role() == Role::Tool)
+        .expect("the failed call's result rides the next request");
+    let ContentPart::ToolResult(result) = tool_message
+        .content()
+        .iter()
+        .find_map(|part| match part {
+            part @ ContentPart::ToolResult(_) => Some(part),
+            _ => None,
+        })
+        .expect("the tool message carries the result")
+    else {
+        unreachable!("the part is a tool result");
+    };
+    let ContentPart::Text { text } = result
+        .content
+        .iter()
+        .find_map(|part| match part {
+            part @ ContentPart::Text { .. } => Some(part),
+            _ => None,
+        })
+        .expect("the failure is text")
+    else {
+        unreachable!("the part is text");
+    };
+    assert!(
+        text.starts_with("[TOOL ERROR]"),
+        "the error flag is rendered into the content: {text}"
     );
 }
 

@@ -7,8 +7,8 @@ use std::time::{Instant, SystemTime};
 use async_trait::async_trait;
 use lithos_llm::middleware::CallContext;
 use lithos_llm::types::{
-    ContentPart, Error as LlmError, FinishReason, Message as LlmMessage, Request, Response,
-    ResponseStream, Role, ToolCall, ToolResult,
+    ContentPart, Error as LlmError, ErrorKind, FinishReason, Message as LlmMessage, Request,
+    Response, ResponseStream, Role, ToolCall, ToolResult,
 };
 use pebble_agent as agent;
 use serde_json::Value;
@@ -916,6 +916,20 @@ impl agent::ModelService for CodingModelService {
             self.model_context.provider.clone(),
             self.model_context.model.clone(),
         ));
+        // fabro-c98c: the openai-wire error-flag wrap rides the REQUEST, not
+        // the first agent build — a tool result that fails mid-session (the
+        // mimo incident class: 176 identical failing calls the model could
+        // not see) reaches every later request rendered too. zai resolves to
+        // the OpenAi profile kind, so the production loop lane is covered by
+        // the same arm.
+        let request = if matches!(
+            self.model_context.profile_kind,
+            AgentProfileKind::OpenAi | AgentProfileKind::Gpt56 | AgentProfileKind::Gpt6
+        ) {
+            render_request_tool_error_flags(&request)?
+        } else {
+            request
+        };
         self.model_context
             .client
             .stream_with_context(request, context)
@@ -1044,22 +1058,15 @@ impl CodingRuntime {
             .unwrap_or_else(PoisonError::into_inner)
             .history
             .to_llm_messages();
-        // fabro-bb27: the openai chat wire has no error marker for tool
-        // messages, so a failed tool result reaches the model looking like a
-        // successful one (lithos openai_chat drops the flag with an
-        // unsupported_control warning). Models that read only the flag then
-        // retry the same failing call indefinitely (observed: 176 identical
-        // invalid-arguments calls over four hours, incident run
-        // 01M59MG9XS2A). For the openai-family profiles the flag is rendered
-        // INTO the content where no model can miss it.
-        let messages = if matches!(
-            self.model_context.profile_kind,
-            AgentProfileKind::OpenAi | AgentProfileKind::Gpt56 | AgentProfileKind::Gpt6
-        ) {
-            render_tool_error_flags_in_content(messages)
-        } else {
-            messages
-        };
+        // fabro-bb27/fabro-c98c: the openai chat wire has no error marker
+        // for tool messages, so a failed tool result reaches the model
+        // looking like a successful one (lithos openai_chat drops the flag
+        // with an unsupported_control warning). Models that read only the
+        // flag then retry the same failing call indefinitely (observed: 176
+        // identical invalid-arguments calls over four hours, incident run
+        // 01M59MG9XS2A). The wrap rides the model service's REQUEST path
+        // (see CodingModelService::stream), which covers the first build's
+        // history and every mid-session failure alike.
         let config = agent::AgentConfig {
             max_output_tokens: max_output_tokens(&self.config, &self.model_context.facts),
             reasoning_effort: self.config.reasoning_effort,
@@ -1316,9 +1323,12 @@ mod tests {
     }
 }
 
-/// fabro-bb27 (ADR fabro-c14e era): for openai-wire profiles, render the
-/// tool-result error flag into the content itself — a prefix no model can
-/// read as success. Native-flag protocols (Anthropic) keep the flag only.
+/// fabro-bb27/fabro-c98c (ADR fabro-c14e era): for openai-wire profiles,
+/// render the tool-result error flag into the content itself — a prefix no
+/// model can read as success. Native-flag protocols (Anthropic) keep the
+/// flag only. The wrap is applied per REQUEST (fabro-c98c: the first
+/// build's once-per-session render left mid-session tool failures
+/// invisible, the mimo tool-loop incident class).
 fn render_tool_error_flags_in_content(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
     messages
         .into_iter()
@@ -1328,14 +1338,15 @@ fn render_tool_error_flags_in_content(messages: Vec<LlmMessage>) -> Vec<LlmMessa
             }
             let mut parts = message.content().to_vec();
             for part in &mut parts {
-                if let ContentPart::ToolResult(result) = part {
-                    if result.is_error && !result.content.is_empty() {
-                        for content in &mut result.content {
-                            if let ContentPart::Text { text } = content {
-                                if !text.starts_with("[TOOL ERROR]") {
-                                    text.insert_str(0, "[TOOL ERROR] ");
-                                }
-                            }
+                if let ContentPart::ToolResult(result) = part
+                    && result.is_error
+                    && !result.content.is_empty()
+                {
+                    for content in &mut result.content {
+                        if let ContentPart::Text { text } = content
+                            && !text.starts_with("[TOOL ERROR]")
+                        {
+                            text.insert_str(0, "[TOOL ERROR] ");
                         }
                     }
                 }
@@ -1350,6 +1361,24 @@ fn render_tool_error_flags_in_content(messages: Vec<LlmMessage>) -> Vec<LlmMessa
             rebuilt
         })
         .collect()
+}
+
+/// Rebuild `request` with the tool-result error flags rendered into the
+/// content ([`render_tool_error_flags_in_content`]); every other setting is
+/// preserved. The builder API appends messages but cannot replace them, so
+/// the rebuild is a serde round-trip over the request's own wire shape with
+/// only `messages` swapped — future request fields ride along without this
+/// code knowing them.
+fn render_request_tool_error_flags(request: &Request) -> StdResult<Request, LlmError> {
+    let rendered = render_tool_error_flags_in_content(request.messages().to_vec());
+    let mut value = serde_json::to_value(request)
+        .map_err(|error| LlmError::new(ErrorKind::InvalidRequest, error.to_string()))?;
+    if let Some(messages) = value.get_mut("messages") {
+        *messages = serde_json::to_value(rendered)
+            .map_err(|error| LlmError::new(ErrorKind::InvalidRequest, error.to_string()))?;
+    }
+    serde_json::from_value(value)
+        .map_err(|error| LlmError::new(ErrorKind::InvalidRequest, error.to_string()))
 }
 
 #[cfg(test)]

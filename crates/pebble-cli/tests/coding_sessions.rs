@@ -746,7 +746,11 @@ wait "$worker"
             2,
             "the cancelled prompt makes no further model call"
         );
-        assert_eq!(tool_output(&requests[1], "worker"), "Cancelled");
+        // fabro-c98c: the cancelled call's result is error-marked, and the
+        // openai-wire request render wraps error-marked results — the next
+        // prompt's model call sees the cancellation as the failure it was
+        // instead of a successful-looking "Cancelled".
+        assert_eq!(tool_output(&requests[1], "worker"), "[TOOL ERROR] Cancelled");
         let end = events.take();
         assert_eq!(
             end.iter()
