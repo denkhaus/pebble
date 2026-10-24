@@ -203,6 +203,12 @@ async fn a_mid_session_failed_tool_result_is_wrapped_in_the_next_request() {
         text.starts_with("[TOOL ERROR]"),
         "the error flag is rendered into the content: {text}"
     );
+    assert!(
+        !result.is_error,
+        "the marker replaces the flag (fabro-c98c): the chat wire reports \
+         unsupported_control for a retained flag, and the marker already \
+         carries the failure"
+    );
 }
 
 #[tokio::test]

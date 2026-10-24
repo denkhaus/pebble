@@ -1329,6 +1329,14 @@ mod tests {
 /// flag only. The wrap is applied per REQUEST (fabro-c98c: the first
 /// build's once-per-session render left mid-session tool failures
 /// invisible, the mimo tool-loop incident class).
+///
+/// The rendered marker REPLACES the structured flag (fabro-c98c): the
+/// openai chat-completions wire has no error marker, drops the flag and
+/// reports `unsupported_control` for every request that still carries one
+/// — the production WARN storm on zai loop runs. Once the marker is in the
+/// content the flag has no reader left on that wire, so it is cleared. The
+/// session state keeps its copy of the flag for the consecutive-error
+/// guard; only this request's rebuild is cleared.
 fn render_tool_error_flags_in_content(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
     messages
         .into_iter()
@@ -1342,12 +1350,21 @@ fn render_tool_error_flags_in_content(messages: Vec<LlmMessage>) -> Vec<LlmMessa
                     && result.is_error
                     && !result.content.is_empty()
                 {
+                    let mut rendered = false;
                     for content in &mut result.content {
-                        if let ContentPart::Text { text } = content
-                            && !text.starts_with("[TOOL ERROR]")
-                        {
-                            text.insert_str(0, "[TOOL ERROR] ");
+                        if let ContentPart::Text { text } = content {
+                            if !text.starts_with("[TOOL ERROR]") {
+                                text.insert_str(0, "[TOOL ERROR] ");
+                            }
+                            rendered = true;
                         }
+                    }
+                    // Only a result whose marker actually reached the content
+                    // drops the flag: an error result with no text (empty, or
+                    // JSON-only) keeps it, so the protocol warning still
+                    // reports that the failure is invisible there.
+                    if rendered {
+                        result.is_error = false;
                     }
                 }
             }
@@ -1416,6 +1433,11 @@ mod tool_error_flag_wrap_tests {
             panic!("error content is text");
         };
         assert_eq!(text, "[TOOL ERROR] boom");
+        assert!(
+            !first.is_error,
+            "the marker replaces the flag (fabro-c98c): the chat wire would \
+             otherwise report unsupported_control for the retained flag"
+        );
         let ContentPart::ToolResult(second) = &wrapped[0].content()[1] else {
             panic!("second part is the success result");
         };
@@ -1439,5 +1461,30 @@ mod tool_error_flag_wrap_tests {
             panic!("text");
         };
         assert_eq!(text, "[TOOL ERROR] boom");
+        assert!(
+            !result.is_error,
+            "a replayed marker still replaces the flag (fabro-c98c)"
+        );
+    }
+
+    /// fabro-c98c: a flag whose marker never reached the content keeps the
+    /// flag — the protocol warning must still report an invisible failure
+    /// (empty or JSON-only error content).
+    #[test]
+    fn a_flag_without_rendered_marker_survives() {
+        let empty = LlmMessage::new(
+            Role::Tool,
+            [ContentPart::ToolResult(ToolResult {
+                tool_call_id: "call_1".into(),
+                name: Some("count".into()),
+                content: Vec::new(),
+                is_error: true,
+            })],
+        );
+        let wrapped = render_tool_error_flags_in_content(vec![empty]);
+        let ContentPart::ToolResult(result) = &wrapped[0].content()[0] else {
+            panic!("tool result");
+        };
+        assert!(result.is_error, "no marker rendered, the flag stays");
     }
 }
